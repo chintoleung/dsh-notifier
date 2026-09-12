@@ -454,12 +454,21 @@ export function createTelegramInbound({ config, bus, vault, store = null, logger
           warn('提问按钮引用容量已满，本次降级为编号通知')
           return null
         }
-        const result = await api('sendMessage', {
-          chat_id: chatId,
-          // P1-1：提问 context 无上游上限（ask_user 入参直传），统一过 4096 钳制
-          text: clampTelegramText(`❓ ${title}\n\n${content}`),
-          reply_markup: { inline_keyboard: [...rows.map((row) => [row]), auxEntries.map((entry) => entry.row)] }, // 一选项一行，手机端可读；末行 ✍️/⏭ 辅助双钮
-        })
+        let result
+        try {
+          result = await api('sendMessage', {
+            chat_id: chatId,
+            // P1-1：提问 context 无上游上限（ask_user 入参直传），统一过 4096 钳制
+            text: clampTelegramText(`❓ ${title}\n\n${content}`),
+            reply_markup: { inline_keyboard: [...rows.map((row) => [row]), auxEntries.map((entry) => entry.row)] }, // 一选项一行，手机端可读；末行 ✍️/⏭ 辅助双钮
+          })
+        } catch (error) {
+          // review P2：发送失败统一回收本次已铸引用（选项钮 + 辅助钮）——否则每张卡
+          // 最多 7 个引用占注册表直至 TTL 到期，连续失败可耗尽 256 容量。
+          for (const entry of [...rowEntries, ...auxEntries]) if (entry.ref !== null) refs.take(entry.ref)
+          warn(`提问卡片发送失败: ${error instanceof Error ? error.message : String(error)}`)
+          return null
+        }
         return { messageId: result?.message_id }
       } catch (error) {
         warn(`提问卡片发送失败: ${error instanceof Error ? error.message : String(error)}`)

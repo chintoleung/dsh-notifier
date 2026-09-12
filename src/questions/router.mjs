@@ -426,6 +426,19 @@ export function createQuestionBridge(deps) {
     const inbound = interactiveEntries().find((entry) => entry.channel === envelope.channel)
     const feedback = (text) => { if (inbound !== undefined) void inbound.sendText(envelope.chatId, text).catch(() => {}) }
     if (optIdx === 'c' || optIdx === 'custom') {
+      // review P2：与 's'/选项钮同判——token 校验 + 问题仍 pending + 原会话来源绑定
+      // （channel+chatId+accountId+userId）。旧卡/错账号/同群旁人不得收到「答：」指引
+      // （自由文本作答仍由 latestPendingFor + Control Core 终裁，此处只封按钮面发现性）。
+      // 'c' 只指引不裁决，故无 Control Core 结算段。
+      const customVerdict = vault.verify(String(action.token ?? ''))
+      if (!customVerdict.ok || customVerdict.key !== qKey) { feedback('作答被拒绝（校验失败）'); return true }
+      const customRow = ledger.get(qKey)
+      if (customRow === undefined || customRow.status !== 'pending') { feedback('该提问已回答或已过期'); return true }
+      const customChat = envelope.chatId !== undefined && envelope.chatId !== null ? String(envelope.chatId) : ''
+      const customTarget = Array.isArray(customRow.pushedTo) ? customRow.pushedTo.find((item) => String(item.channel) === String(envelope.channel) && String(item.chatId) === customChat && (item.accountId === undefined || String(item.accountId) === String(envelope.accountId ?? '')) && String(item.userId) === String(envelope.userId)) : null
+      // find 未命中返回 undefined（非 null）：显式双判，缺一即放行的洞在 's' 由 Control Core
+      // 兜底，'c' 无结算段必须自守。
+      if (customTarget === null || customTarget === undefined || customChat === '') { feedback('请到原会话操作'); return true }
       feedback('✍️ 自定义回答：直接回复「答：<你的回答>」')
       return true
     }
@@ -438,7 +451,11 @@ export function createQuestionBridge(deps) {
       // aq-skip 也纳入 accountId 的来源绑定：同一 chat/user 但不同账号（multi-account 同聊天）
       // 不得凭 userId 单独命中——pushedTo 只计与事件账号一致的目标，否则 fail-closed 原会话。
       const target = Array.isArray(row.pushedTo) ? row.pushedTo.find((item) => String(item.channel) === String(envelope.channel) && String(item.chatId) === sourceChat && (item.accountId === undefined || String(item.accountId) === String(envelope.accountId ?? '')) && String(item.userId) === String(envelope.userId)) : null
-      if (target === null || sourceChat === '') { feedback('请到原会话操作'); return true }
+      // find 未命中返回 undefined：原单判 === null 会放行错 userId 点击——同渠道/账号/会话的
+      // 其他白名单用户可经 Control Core buildEvent 的 userId 重写「洗白」后误落 skipped
+      // （MOA review 实测复现）。双判在路由层封死该旁路；Control Core 直收原始 envelope
+      // 并在 buildEvent 重写 userId 的设计缺陷另立 issue 跟进。
+      if (target === null || target === undefined || sourceChat === '') { feedback('请到原会话操作'); return true }
       // 跳过一律经共享 Control Core 的 question-answer 契约裁决（授权/来源/策略/群聊 fail-closed），
       // 结算走 settleSkip（仍以 bus.settle 首达采纳为唯一落账点）。控制缺失 → fail-closed：
       // 绝不直结（不再回退 bus.settle），防止无授权即放行跳过。

@@ -1538,6 +1538,54 @@ test('P1 跳过经 Control Core：QQ 群聊回调 fail-closed（group_chat_disab
   rig.bridge.dispose()
 })
 
+test('P1 ⏭ 同会话错 userId 不得结算：s 预检 find 未命中即拒（MOA review 实测旁路的回归测试）', async () => {
+  const rig = makeControlRig({ channel: 'telegram', accountId: 'tg-acc', chatId: '900113', userId: 'u1' })
+  const p = rig.bridge.askQuestions({ questions: [SINGLE] })
+  await sleep(30)
+  const qKey = rig.store.keys('aq:')[0]
+  const token = rig.vault.mint(qKey)
+  // 同 channel/accountId/chatId、白名单内他人（u-other）点 ⏭：修复前 s 预检 find 未命中
+  // 返回 undefined 而 === null 单判放行，随后 Control Core buildEvent 以 pushedTo 目标重写
+  // userId → authorize 通过 → settleSkip 误落 skipped。现预检双判直接拒。
+  rig.bus.accept({ channel: 'telegram', accountId: 'tg-acc', chatType: 'private', userId: 'u-other', chatId: '900113', messageId: 'm-u2s', questionAction: { qKey, optIdx: 's', token } })
+  assert.equal(rig.store.get(qKey).status, 'pending', '同会话错 userId 的 ⏭ 不得结算')
+  assert.match(rig.texts.at(-1)?.text ?? '', /请到原会话操作/, '错 userId 跳过被拒并回执')
+  assert.ok(!/已跳过/.test(rig.texts.at(-1)?.text ?? ''), '错 userId 绝不得获跳过着落回执')
+  // 正主 u1 仍可正常跳过（守卫收紧不误伤）
+  rig.bus.accept({ channel: 'telegram', accountId: 'tg-acc', chatType: 'private', userId: 'u1', chatId: '900113', messageId: 'm-u1s', questionAction: { qKey, optIdx: 's', token } })
+  const result = await p
+  assert.equal(result.answered, false, '跳过即交还桌面')
+  assert.equal(rig.store.get(qKey).decision, 'skipped', '正主跳过仍正常落账')
+  rig.bridge.dispose()
+})
+
+test('P1 ✍️ 指引与 skip 同判：外来 token / 错账号 / 早决旧卡一律拒，正确来源才给「答：」指引（review P2）', async () => {
+  const rig = makeControlRig({ channel: 'telegram', accountId: 'tg-acc', chatId: '900113', userId: 'u1' })
+  const p = rig.bridge.askQuestions({ questions: [SINGLE] })
+  await sleep(30)
+  const qKey = rig.store.keys('aq:')[0]
+  const token = rig.vault.mint(qKey)
+  // 外来 token（为别的问题铸造）→ 校验失败，不给指引
+  rig.bus.accept({ channel: 'telegram', accountId: 'tg-acc', chatType: 'private', userId: 'u1', chatId: '900113', messageId: 'm-ck', questionAction: { qKey, optIdx: 'c', token: rig.vault.mint('aq:other') } })
+  assert.match(rig.texts.at(-1)?.text ?? '', /作答被拒绝（校验失败）/, '外来 token 不给「答：」指引')
+  // 同 user 同 chat 错账号 → pushedTo 不命中 → 拒
+  rig.bus.accept({ channel: 'telegram', accountId: 'tg-evil', chatType: 'private', userId: 'u1', chatId: '900113', messageId: 'm-ce', questionAction: { qKey, optIdx: 'c', token } })
+  assert.match(rig.texts.at(-1)?.text ?? '', /请到原会话操作|作答被拒绝/, '错账号不给「答：」指引')
+  assert.ok(!/自定义回答/.test(rig.texts.at(-1)?.text ?? ''), '错账号绝不得收到「答：」指引')
+  assert.equal(rig.store.get(qKey).status, 'pending', '指引路径不裁决，问题保持待决')
+  // 正确来源 → 指引；随后自由文本作答结算
+  rig.bus.accept({ channel: 'telegram', accountId: 'tg-acc', chatType: 'private', userId: 'u1', chatId: '900113', messageId: 'm-cok', questionAction: { qKey, optIdx: 'c', token } })
+  assert.match(rig.texts.at(-1)?.text ?? '', /✍️ 自定义回答：直接回复「答：/, '正确来源收到「答：」指引')
+  rig.bus.accept({ channel: 'telegram', accountId: 'tg-acc', chatType: 'private', userId: 'u1', chatId: '900113', messageId: 'm-ans', text: '答：我选生产' })
+  const result = await p
+  assert.equal(result.answered, true)
+  assert.deepEqual(result.results[0].answers, ['我选生产'])
+  // 早决后旧卡点 ✍️ → 已过期，不再给指引
+  rig.bus.accept({ channel: 'telegram', accountId: 'tg-acc', chatType: 'private', userId: 'u1', chatId: '900113', messageId: 'm-cstale', questionAction: { qKey, optIdx: 'c', token } })
+  assert.match(rig.texts.at(-1)?.text ?? '', /该提问已回答或已过期/, '早决旧卡不再给「答：」指引')
+  rig.bridge.dispose()
+})
+
 test('P1 自定义答 replay/去重：同 messageId 重复入站不重复结算，账本只记一次', async () => {
   const rig = makeControlRig({ channel: 'telegram', accountId: 'tg-acc', chatId: '900113', userId: 'u1' })
   const p = rig.bridge.askQuestions({ questions: [SINGLE] })

@@ -134,7 +134,7 @@ test('P1-1 提问卡超长 context：同样截断到 4096 内仍送达（ask_use
   const { fetchImpl, calls } = makeFetch({ sendMessage: { ok: true, result: { message_id: 12 } } })
   const vault = createTokenVault({ secret: 'k' })
   const tg = createTelegramInbound({ config: CONFIG, bus: makeBus(), vault, fetchImpl })
-  const token = vault.mint('aq:q1:0')
+  const token = vault.mint('aq:q1') // review P2：token 必须与 qKey 一致（生产 router 以 vault.mint(qKey) 铸造）
   const card = await tg.sendQuestionCard({
     chatId: 100, title: '提问：选哪个方案', content: 'x'.repeat(9000),
     qKey: 'aq:q1', token, options: ['方案 A', '方案 B'],
@@ -154,7 +154,7 @@ test('提问卡末行辅助双钮：✍️自定义回答 / ⏭跳过（handler 
   const tg = createTelegramInbound({ config: CONFIG, bus: makeBus(), vault, fetchImpl })
   const card = await tg.sendQuestionCard({
     chatId: 100, title: 'q', content: 'c', qKey: 'aq:aux1',
-    token: vault.mint('aq:aux1:0'), options: ['方案 A', '方案 B'],
+    token: vault.mint('aq:aux1'), options: ['方案 A', '方案 B'],
   })
   assert.deepEqual(card, { messageId: 22 })
   const rows = calls[0].body.reply_markup.inline_keyboard
@@ -180,11 +180,74 @@ test('辅助钮容量耗尽：整卡降级编号兜底并回收已铸引用（�
   const before = calls.length
   assert.equal(await tg.sendQuestionCard({
     chatId: 100, title: 'partial', content: 'c',
-    qKey: 'aq:aux2', token: vault.mint('aq:aux2:0'), options: ['A', 'B'],
+    qKey: 'aq:aux2', token: vault.mint('aq:aux2'), options: ['A', 'B'],
   }), null)
   assert.equal(calls.length, before, '容量中途耗尽时不发送缺辅助钮的残卡')
   assert.deepEqual(await tg.sendActionCard({ chatId: 100, title: 'reclaimed', content: 'c', actions: [{ label: 'a', data: 'ac:after' }] }), { messageId: 23 })
   assert.equal(calls.length, before + 1, '失败卡已回收选项钮引用，下一张可正常发送')
+})
+
+test('提问卡发送失败回收已铸引用：注册表不被失败卡占位（review P2）', async () => {
+  let questionSendFails = false
+  const { fetchImpl } = makeFetch({
+    sendMessage: () => (questionSendFails === true ? { ok: false, description: 'mock send fail' } : { ok: true, result: { message_id: 24 } }),
+  }, { delayMs: 0 })
+  const vault = createTokenVault({ secret: 'k' })
+  const tg = createTelegramInbound({ config: CONFIG, bus: makeBus(), vault, fetchImpl })
+  // 占 252：提问卡需 4 引用（2 选项 + 2 辅助），252 + 4 = 256 恰满。发送失败若不回收，
+  // 注册表被失败卡占满 → 下一张动作卡铸不出引用而降级；回收则可正常发送。
+  // 边界精确设计（勿动 preload 数）：改 253 会使失败卡在铸造中途耗尽，测试静默改走
+  // 「容量耗尽」路径而非「发送失败」路径，本测即失效（MOA review Agent 3 指出）。
+  for (let i = 0; i < 252; i += 1) {
+    await tg.sendActionCard({ chatId: 100, title: 't', content: 'c', actions: [{ label: `a${i}`, data: `ac:${i}` }] })
+  }
+  questionSendFails = true
+  assert.equal(await tg.sendQuestionCard({
+    chatId: 100, title: 'boom', content: 'c', qKey: 'aq:boom', token: vault.mint('aq:boom'), options: ['A', 'B'],
+  }), null, 'sendMessage 失败整卡返回 null（caller 降级编号）')
+  questionSendFails = false
+  assert.deepEqual(await tg.sendActionCard({ chatId: 100, title: 'after', content: 'c', actions: [{ label: 'a', data: 'ac:after' }] }), { messageId: 24 }, '失败卡引用已回收，注册表仍有容量')
+})
+
+test('✍️/⏭ 辅助钮入站契约：r:<ref> 展开 → aq 解析 → control.handle 收到一致 qKey/optIdx/token（review P2 / MOA-B2）', async () => {
+  // MOA-B2：本测只覆盖「入站接线契约」。真实 Control Core 回执（src/control/contract.mjs
+  // makeReceipt）只有 status/eventId/sessionId/reason，绝无 message 字段——stub 返回最小
+  // 契约形状，不断言回执文案。'c'/'s' 的裁决与结算语义由 questions.test.mjs 真组件测试
+  // 覆盖；Telegram 通道 'c'/'s' 点击不落 settle 为已知缺口（跟进 issue，勿在此断言）。
+  const handled = []
+  const control = { handle: (p) => { handled.push(p); return { status: 'accepted' } } }
+  const vault = createTokenVault({ secret: 'k' })
+  const token = vault.mint('aq:chain1')
+  const queue = []
+  const { fetchImpl, calls } = makeFetch({
+    sendMessage: { ok: true, result: { message_id: 25 } },
+    answerCallbackQuery: { ok: true, result: {} },
+    editMessageText: { ok: true, result: {} },
+    getUpdates: () => ({ ok: true, result: queue.splice(0, 2) }),
+  })
+  const tg = createTelegramInbound({ config: CONFIG, bus: makeBus(), vault, fetchImpl, errorBackoffMs: 10, control, questions: { decide: () => ({ ok: true, message: '✅ 已作答' }) } })
+
+  await tg.sendQuestionCard({ chatId: 100, title: 'q', content: 'c', qKey: 'aq:chain1', token, options: ['A', 'B'] })
+  const rows = calls.find((call) => call.method === 'sendMessage').body.reply_markup.inline_keyboard
+  const [customRef, skipRef] = [rows[2][0].callback_data, rows[2][1].callback_data]
+  assert.ok(customRef.startsWith('r:') && skipRef.startsWith('r:'), '辅助钮均为短引用')
+
+  queue.push(
+    { update_id: 1, callback_query: { id: 'aux-c', from: { id: 42 }, message: { chat: { id: 100 }, message_id: 25 }, data: customRef } },
+    { update_id: 2, callback_query: { id: 'aux-s', from: { id: 42 }, message: { chat: { id: 100 }, message_id: 25 }, data: skipRef } },
+  )
+  tg.start()
+  await new Promise((resolve) => setTimeout(resolve, 80))
+  await tg.stop()
+
+  assert.equal(handled.length, 2, '两个辅助钮点击各到达 Control Core 一次')
+  assert.deepEqual(
+    handled.map((h) => [h.qKey, h.optIdx, h.token]),
+    [['aq:chain1', 'c', token], ['aq:chain1', 's', token]],
+    'ref 展开后 qKey/optIdx/token 与铸卡时一致（deepEqual 为回声校验，证明接线；token↔qKey 绑定语义由 questions.test.mjs 真桥测试守）',
+  )
+  const answers = calls.filter((call) => call.method === 'answerCallbackQuery')
+  assert.equal(answers.length, 2, '两次点击均有 answerCallbackQuery 回执（消费闭环，不断言文案）')
 })
 
 test('P1-1 动作卡超长 content：同样截断到 4096 内仍送达（心跳/卡住文案防线）', async () => {
